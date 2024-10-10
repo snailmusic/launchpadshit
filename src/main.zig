@@ -10,7 +10,7 @@ const portmidi = @cImport({
 
 const GRIDCOLOR = 117;
 const ACCENTCOLOR = 116;
-const WHITE = 3;
+const WHITE = 32;
 
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
