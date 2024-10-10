@@ -10,7 +10,8 @@ const portmidi = @cImport({
 
 const GRIDCOLOR = 117;
 const ACCENTCOLOR = 116;
-const WHITE = 32;
+const WHITE = 3;
+const GREEN = 32;
 
 pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
@@ -38,8 +39,16 @@ pub fn main() !void {
     var sequenceOut: ?*portmidi.PmStream = null;
     const sequenceId = portmidi.Pm_CreateVirtualOutput("Launchpad Sequencer Output", "ALSA", null);
     _ = portmidi.Pm_OpenOutput(&sequenceOut, sequenceId, null, 8, null, null, 16);
+    defer _ = portmidi.Pm_Close(sequenceOut);
 
-    try show_grid(launchpadOut);
+    var sequence: [8][8]bool = undefined;
+    @memset(&sequence, [8]bool{ false, false, false, false, false, false, false, false });
+
+    const notes = [8]u8{ 60, 62, 63, 65, 67, 68, 70, 72 };
+
+    var playhead: u3 = 0;
+
+    var boom = false;
 
     while (true) {
         var input_buffer: [8]portmidi.PmEvent = undefined;
@@ -50,22 +59,50 @@ pub fn main() !void {
                 // var note_data = midiData(value.message);
                 // note_data.note_val += 10;
                 var notedata = get_message_note(value.message);
-                const sequenceNoteOut = map_launchpad_to_note(notedata, notedata.vel);
-
                 std.debug.print("num: {}, vel: {}, channel: {}\n", .{ notedata.num, notedata.vel, notedata.chan });
-                if (notedata.vel != 0) {
-                    notedata.vel = WHITE;
-                } else {
-                    if (is_white_key(sequenceNoteOut.num)) {
-                        notedata.vel = ACCENTCOLOR;
+                const b_x = notedata.num % 10 - 1;
+                const b_y = notedata.num / 10 - 1;
+                if (b_x != 9 and notedata.vel == 127) {
+                    sequence[b_y][b_x] = !sequence[b_y][b_x];
+                    if (sequence[b_y][b_x]) {
+                        notedata.vel = WHITE;
                     } else {
-                        notedata.vel = GRIDCOLOR;
+                        notedata.vel = 0;
+                    }
+                    _ = portmidi.Pm_WriteShort(launchpadOut, value.timestamp, get_note_message(notedata));
+                }
+                // _ = portmidi.Pm_WriteShort(sequenceOut, value.timestamp, get_note_message(sequenceNoteOut));
+            }
+        }
+        if (@rem(portmidi.Pt_Time(), 250) == 0) {
+            if (boom) {
+                try sequencer_row(launchpadOut, playhead, sequence);
+                for (sequence, 0..) |rows, i| {
+                    const is_playing = rows[playhead];
+                    const was_playing = rows[@subWithOverflow(playhead, 1)[0]];
+                    if (was_playing) {
+                        const note = NoteData{
+                            .num = notes[i],
+                            .chan = 0,
+                            .vel = 0,
+                        };
+                        _ = portmidi.Pm_WriteShort(sequenceOut, portmidi.Pt_Time(), get_note_message(note));
+                    }
+
+                    if (is_playing) {
+                        const note = NoteData{
+                            .num = notes[i],
+                            .chan = 0,
+                            .vel = 127,
+                        };
+                        _ = portmidi.Pm_WriteShort(sequenceOut, portmidi.Pt_Time() + 1, get_note_message(note));
                     }
                 }
-                _ = portmidi.Pm_WriteShort(launchpadOut, value.timestamp, get_note_message(notedata));
-
-                _ = portmidi.Pm_WriteShort(sequenceOut, value.timestamp, get_note_message(sequenceNoteOut));
+                playhead = @addWithOverflow(playhead, 1)[0];
             }
+            boom = false;
+        } else {
+            boom = true;
         }
     }
 
@@ -114,33 +151,31 @@ fn get_message_note(data: u32) NoteData {
     return out;
 }
 
-fn show_grid(output: ?*portmidi.PmStream) !void {
-    const time = portmidi.Pt_Time();
-    for (1..9) |i| {
-        for (1..9) |j| {
-            const iu8 = @as(u8, @intCast(i));
-            const ju8 = @as(u8, @intCast(j));
-            var gridcolor: u8 = GRIDCOLOR;
-            if (is_white_key((ju8 - 1) * 5 + (iu8 - 1))) {
-                gridcolor = ACCENTCOLOR;
-            }
-
-            const noteData = NoteData{ .num = (ju8 * 10) + iu8, .vel = gridcolor, .chan = 0 };
-
-            _ = portmidi.Pm_WriteShort(output.?, time, get_note_message(noteData));
-        }
-    }
-}
-
-fn map_launchpad_to_note(notedata: NoteData, velocity: u8) NoteData {
-    const y = notedata.num / 10;
-    const x = notedata.num % 10;
-    var outNote = (x - 1) + (y - 1) * 5;
-    outNote += 60;
-    return NoteData{ .num = outNote, .vel = velocity, .chan = 0 };
-}
-
 inline fn is_white_key(num: u8) bool {
     const wrapped = num % 12;
     return wrapped == 0 or wrapped == 2 or wrapped == 4 or wrapped == 5 or wrapped == 7 or wrapped == 9 or wrapped == 11;
+}
+
+fn set_row(output: ?*portmidi.PmStream, column: u4, color: u8) !void {
+    var message = [10]u8{ 0xf0, 0x00, 0x20, 0x29, 0x02, 0x18, 0x0c, @as(u8, column), color, 0xF7 };
+    _ = portmidi.Pm_WriteSysEx(output.?, portmidi.Pt_Time(), &message);
+}
+
+fn sequencer_row(output: ?*portmidi.PmStream, column: u3, sequence: [8][8]bool) !void {
+    try set_row(output, column, ACCENTCOLOR);
+    try set_row(output, @subWithOverflow(column, 1)[0], 0);
+
+    for (sequence, 0..) |rows, i| {
+        for (rows, 0..) |cell, j| {
+            if (cell) {
+                var notedata = NoteData{ .num = @as(u8, @intCast(j + 11 + i * 10)), .vel = 127, .chan = 0 };
+                if (j == column) {
+                    notedata.vel = GREEN;
+                } else {
+                    notedata.vel = WHITE;
+                }
+                _ = portmidi.Pm_WriteShort(output, portmidi.Pt_Time(), get_note_message(notedata));
+            }
+        }
+    }
 }
